@@ -68,12 +68,12 @@ cleanup() {
   set +e
   k -n "$NS" delete pod -l app.kubernetes.io/part-of=gf-amd-test --wait=true --timeout=120s >/dev/null 2>&1
   k -n "$NS" delete configmap gf-amd-probe >/dev/null 2>&1
-  # the plugin (by its own PID), then dmem off again from the bottom up (it was off before; refused while in use)
+  # the plugin (by its own PID), then dmem off again, bottom-up, only where it was off before the test
   g "sudo sh -c '[ -f $REMOTE/pid ] && kill \$(cat $REMOTE/pid); sleep 1
-     for c in /sys/fs/cgroup/kubepods.slice/kubepods-*.slice /sys/fs/cgroup/kubepods.slice /sys/fs/cgroup; do
+     for c in $DMEM_OFF; do
        grep -qw dmem \$c/cgroup.subtree_control 2>/dev/null && echo -dmem > \$c/cgroup.subtree_control 2>/dev/null; done
      rm -rf $REMOTE'"
-  say "cleanup: test pods, plugin, dmem settings and $REMOTE on $NODE removed"
+  say "cleanup: test pods, plugin, dmem settings fractiond added and $REMOTE on $NODE removed"
 }
 
 : > "$OUT"
@@ -83,7 +83,11 @@ k get node "$NODE" >/dev/null || die "node $NODE not in the cluster"
 k get ns "$NS" >/dev/null || die "namespace $NS not found (Run:ai project with an AMD GPU)"
 say "node: kernel $(g uname -r); dmem regions: $(g cat /sys/fs/cgroup/dmem.capacity 2>/dev/null | tr '\n' ' ')"
 g grep -q '^drm/.*/vram' /sys/fs/cgroup/dmem.capacity || die "no amdgpu VRAM region in dmem.capacity on $NODE (kernel 6.14+, GPU on amdgpu)"
-g "grep -qw dmem /sys/fs/cgroup/cgroup.subtree_control" && die "dmem is already enabled on $NODE; clean up first"
+# the kubelet usually enables every controller down the kubepods tree, dmem included; remember the levels it is off in
+# (bottom-up), so cleanup turns off only what fractiond turned on
+DMEM_OFF=$(g "for c in /sys/fs/cgroup /sys/fs/cgroup/kubepods.slice /sys/fs/cgroup/kubepods.slice/kubepods-*.slice; do
+  grep -qw dmem \$c/cgroup.subtree_control || echo \$c; done | tac | xargs")
+say "dmem off before the test in: ${DMEM_OFF:-none (already enabled down to the pods)}"
 trap cleanup EXIT
 
 sed "s/__NS__/$NS/" <<'EOF' | k apply -f - >/dev/null

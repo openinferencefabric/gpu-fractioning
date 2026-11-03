@@ -16,7 +16,7 @@ This fork adds an AMD backend to `fractiond`, the NRI plugin that enforces a fra
 
 1. KAI's binder names the GPU and the pod's share in two annotations: `oif.ai/amd-gpu` and `oif.ai/amd-gpu-fraction`.
 2. On `CreateContainer`, `fractiond` checks that the GPU's region is listed in `/sys/fs/cgroup/dmem.capacity`.
-3. It enables `dmem` in `cgroup.subtree_control` from the root down to the pod's parent.
+3. It enables `dmem` in `cgroup.subtree_control` from the root down to the pod's parent, wherever it is not on yet. The kubelet usually has it on already, because it enables every controller the kernel offers.
 4. It sets `dmem.max = fraction × VRAM` on the pod cgroup.
 5. The containers' allocations are charged to that pod cgroup. Past the share, `hipMalloc` fails with `hipErrorOutOfMemory`. Other pods on the same GPU are unaffected.
 
