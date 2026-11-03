@@ -21,7 +21,7 @@ D=$(cd "$(dirname "$0")" && pwd) REMOTE=/var/tmp/oif-gf CACHE=/var/tmp/oif-bench
 k() { ssh "$CP" sudo kubectl --kubeconfig /etc/kubernetes/admin.conf "$@"; }
 g() { ssh "$NODE" "$@"; }
 
-VENDOR=$(k get node "$NODE" -o jsonpath='{.metadata.labels.oif\.ai/gpu-vendor}')
+VENDOR=$(k get node "$NODE" -L oif.ai/gpu-vendor --no-headers | awk '{print $NF}')   # no jsonpath: ssh's shell eats escapes
 case $VENDOR in
   amd) IMAGE=${VLLM_IMAGE:-docker.io/rocm/vllm:rocm7.13.0_gfx110X-all_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1@sha256:09dcd1437d20f70c60a91d4ece04e73e4c72b341d9da2a9546fe6bb3b4eec4e4}
     GPU_RES=amd.com/gpu HALF_UTIL=0.45 SIZE="10.6 GB" ;;
@@ -29,7 +29,7 @@ case $VENDOR in
     GPU_RES=nvidia.com/gpu HALF_UTIL=0.9 SIZE="9.8 GB" ;;
   *) echo "node $NODE has no oif.ai/gpu-vendor label (amd or nvidia)"; exit 1 ;;
 esac
-RD=$D/bench-$VENDOR-$(date +%Y%m%d-%H%M); mkdir -p "$RD"; OUT=$RD/console.txt
+P=${VENDOR:0:3} RD=$D/bench-$VENDOR-$(date +%Y%m%d-%H%M); mkdir -p "$RD"; OUT=$RD/console.txt
 say() { echo "$*" | tee -a "$OUT"; }
 die() { say "FAIL: $*"; exit 1; }
 
@@ -42,7 +42,7 @@ kind: Pod
 metadata:
   name: $1
   namespace: $NS
-  labels: {runai/node-pool: $VENDOR, app.kubernetes.io/part-of: gf-amd-bench}
+  labels: {runai/node-pool: $VENDOR, app.kubernetes.io/part-of: gf-bench-$VENDOR}
   $ann
 spec:
   schedulerName: runai-scheduler
@@ -104,7 +104,7 @@ stop() { k -n "$NS" delete pod "$@" --wait=true --timeout=120s >/dev/null 2>&1 |
 
 cleanup() {
   set +e
-  k -n "$NS" delete pod -l app.kubernetes.io/part-of=gf-amd-bench --wait=true --timeout=120s >/dev/null 2>&1
+  k -n "$NS" delete pod -l app.kubernetes.io/part-of=gf-bench-$VENDOR --wait=true --timeout=120s >/dev/null 2>&1
   g "sudo sh -c '[ -f $REMOTE/pid ] && kill \$(cat $REMOTE/pid); sleep 1
      for c in $DMEM_OFF; do
        grep -qw dmem \$c/cgroup.subtree_control 2>/dev/null && echo -dmem > \$c/cgroup.subtree_control 2>/dev/null; done
@@ -139,6 +139,13 @@ if ! g "sudo crictl inspecti $IMAGE" >/dev/null 2>&1; then
   wait $pull || { cat "$RD/pull.log"; die "image pull failed"; }
 fi
 
+# one benchmark at a time: both GPUs throttle when loaded together on the lab chassis (ADR-009)
+others() { ps -eo sid=,args= | awk -v s="$(ps -o sid= $$ | tr -d ' ')" '$1 != s && /bench-qwen3\.sh/ && !/awk/' | grep -q .; }
+if others; then
+  say "waiting for the other benchmark on this host to finish (one GPU loaded at a time)"
+  while others; do sleep 30; done
+fi
+
 if [ "$VENDOR" = amd ]; then
   g "mkdir -p $REMOTE" && scp -q "$D/fractiond" "$NODE:$REMOTE/fractiond"
   g "sudo sh -c 'cd $REMOTE && nohup ./fractiond --gpu-vendor=amd --plugin-name=oif-amd-dmem --plugin-idx=20 --readiness-port=0 --map-dir=$REMOTE/map > $REMOTE/fractiond.log 2>&1 & echo \$! > $REMOTE/pid'"
@@ -150,31 +157,31 @@ else
 fi
 
 say; say "A. whole GPU, vLLM at 0.9 (the first start downloads the model)"
-pod q-whole whole 0.9; wait_ready q-whole || die "q-whole: $(k -n "$NS" logs q-whole 2>&1 | tail -3)"
-say "   q-whole $(pod_mem q-whole)"; bench q-whole A-whole; stop q-whole
+pod $P-whole whole 0.9; wait_ready $P-whole || die "$P-whole: $(k -n "$NS" logs $P-whole 2>&1 | tail -3)"
+say "   $P-whole $(pod_mem $P-whole)"; bench $P-whole A-whole; stop $P-whole
 
 say; say "B. one 0.5 pod with the hard cap, vLLM at $HALF_UTIL"
-pod q-half 0.5 $HALF_UTIL; wait_ready q-half || die "q-half: $(k -n "$NS" logs q-half 2>&1 | tail -3)"
-say "   q-half $(pod_mem q-half)"; bench q-half B-half
+pod $P-half 0.5 $HALF_UTIL; wait_ready $P-half || die "$P-half: $(k -n "$NS" logs $P-half 2>&1 | tail -3)"
+say "   $P-half $(pod_mem $P-half)"; bench $P-half B-half
 
 say; say "C. two 0.5 pods on the same GPU, benchmarked together"
-pod q-half2 0.5 $HALF_UTIL; wait_ready q-half2 || die "q-half2: $(k -n "$NS" logs q-half2 2>&1 | tail -3)"
-say "   q-half  $(pod_mem q-half)"; say "   q-half2 $(pod_mem q-half2)"
-bench q-half C-pod1 & b1=$!; bench q-half2 C-pod2 & b2=$!
+pod $P-half2 0.5 $HALF_UTIL; wait_ready $P-half2 || die "$P-half2: $(k -n "$NS" logs $P-half2 2>&1 | tail -3)"
+say "   $P-half  $(pod_mem $P-half)"; say "   $P-half2 $(pod_mem $P-half2)"
+bench $P-half C-pod1 & b1=$!; bench $P-half2 C-pod2 & b2=$!
 wait $b1 && wait $b2 || die "concurrent benchmark failed"
-stop q-half q-half2
+stop $P-half $P-half2
 
 say; say "D. a 0.5 pod whose vLLM asks for 0.9 of the memory it sees"
-pod q-greedy 0.5 0.9
-if wait_ready q-greedy; then
-  refused=0; say "   q-greedy $(pod_mem q-greedy)"
+pod $P-greedy 0.5 0.9
+if wait_ready $P-greedy; then
+  refused=0; say "   $P-greedy $(pod_mem $P-greedy)"
   if [ "$VENDOR" = nvidia ]; then say "   started inside its share: the limit is transparent (vLLM sees only the share)"
   else say "   FAIL vLLM started past its cap"; fi
 else
-  refused=1; say "   q-greedy $(pod_mem q-greedy)"
-  k -n "$NS" logs q-greedy 2>&1 | grep -iE 'out of memory|OutOfMemory|hipError|cudaError' | tail -2 | cut -c1-220 | sed 's/^/   q-greedy: /' | tee -a "$OUT"
+  refused=1; say "   $P-greedy $(pod_mem $P-greedy)"
+  k -n "$NS" logs $P-greedy 2>&1 | grep -iE 'out of memory|OutOfMemory|hipError|cudaError' | tail -2 | cut -c1-220 | sed "s/^/   $P-greedy: /" | tee -a "$OUT"
 fi
-stop q-greedy
+stop $P-greedy
 [ "$VENDOR" = amd ] && say "   fractiond: $(g "grep -h 'capped AMD GPU memory' $REMOTE/fractiond.log" | sed -E 's/.*"pod":"([^"]*)".*"limitMiB":([0-9]+).*/\1=\2 MiB/' | tr '\n' ' ')"
 
 say; say "results (median / p99 in ms; throughput in output tokens/s):"
