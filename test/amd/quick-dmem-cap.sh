@@ -1,7 +1,7 @@
 #!/bin/bash
 # Quick lab test of fractiond's AMD backend (--gpu-vendor=amd): the kernel caps a fractional AMD pod's VRAM.
 # On an Open Inference Fabric cluster (KAI places AMD fractions, oif-amd-share gives the pod the GPU): pods ask the
-# scheduler for a share of the AMD GPU, then try to allocate far more than that share with PyTorch's own limit lifted.
+# scheduler for a share of the AMD GPU, then try to allocate far more than that share (vram-probe: HSA, the KFD path HIP uses).
 #   1. control, no plugin:   a 0.25 pod allocates 30 GiB (nothing stops it)
 #   2. fractiond --gpu-vendor=amd running on the GPU node:
 #        the 0.25 pod is stopped near 1/4 of the VRAM (dmem.max on its pod cgroup, hipErrorOutOfMemory)
@@ -13,13 +13,13 @@ set -euo pipefail
 CP=${1:-cp1} NODE=${2:-gpu-amd} NS=${3:-runai-team-c}
 D=$(cd "$(dirname "$0")" && pwd) OUT=$D/results-$(date +%Y%m%d-%H%M).txt
 REMOTE=/var/tmp/oif-gf
-IMAGE=docker.io/rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0@sha256:099f59a3bee9c436f5cc57db6bc6076fdeda579c57e9e22ae40f856d5905b3e4
+IMAGE=${VRAM_PROBE_IMAGE:-docker.io/manmohanbrahma/oif-vram-probe:0.1@sha256:7b5b53e667c3f6cc940d64516db6395ecb00f160d8185bf58f8d06b8d20c9560}   # built from vram-probe/
 say() { echo "$*" | tee -a "$OUT"; }
 die() { say "FAIL: $*"; exit 1; }
 k() { ssh "$CP" sudo kubectl --kubeconfig /etc/kubernetes/admin.conf "$@"; }
 g() { ssh "$NODE" "$@"; }
 
-pod() {   # name fraction want_gib hold_s: a KAI-scheduled pod on the amd pool that allocates want_gib, PyTorch limit lifted
+pod() {   # name fraction want_gib hold_s: a KAI-scheduled pod on the amd pool that allocates want_gib
   cat <<EOF | k apply -f - >/dev/null
 apiVersion: v1
 kind: Pod
@@ -37,13 +37,10 @@ spec:
     - name: main
       image: $IMAGE
       env: [{name: WANT_GIB, value: "$3"}, {name: HOLD, value: "$4"}]
-      command: [sh, -c, "unset PYTORCH_ALLOC_CONF PYTORCH_HIP_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF; exec python3 -u /probe/probe.py"]
-      volumeMounts: [{name: probe, mountPath: /probe}]
-  volumes: [{name: probe, configMap: {name: gf-amd-probe}}]
 EOF
 }
 
-wait_hold() {   # pod: until it prints HOLDING or ends (the first run may pull the ~20 GB image)
+wait_hold() {   # pod: until it prints HOLDING or ends (the first run pulls the image)
   local i phase
   for i in $(seq 1 360); do
     k -n "$NS" logs "$1" 2>/dev/null | grep -q HOLDING && return 0
@@ -67,7 +64,6 @@ show() { k -n "$NS" logs "$1" 2>&1 | grep -v HOLDING | sed "s/^/   $1: /" | tee 
 cleanup() {
   set +e
   k -n "$NS" delete pod -l app.kubernetes.io/part-of=gf-amd-test --wait=true --timeout=120s >/dev/null 2>&1
-  k -n "$NS" delete configmap gf-amd-probe >/dev/null 2>&1
   # the plugin (by its own PID), then dmem off again, bottom-up, only where it was off before the test
   g "sudo sh -c '[ -f $REMOTE/pid ] && kill \$(cat $REMOTE/pid); sleep 1
      for c in $DMEM_OFF; do
@@ -89,26 +85,6 @@ DMEM_OFF=$(g "for c in /sys/fs/cgroup /sys/fs/cgroup/kubepods.slice /sys/fs/cgro
   grep -qw dmem \$c/cgroup.subtree_control || echo \$c; done | tac | xargs")
 say "dmem off before the test in: ${DMEM_OFF:-none (already enabled down to the pods)}"
 trap cleanup EXIT
-
-sed "s/__NS__/$NS/" <<'EOF' | k apply -f - >/dev/null
-apiVersion: v1
-kind: ConfigMap
-metadata: {name: gf-amd-probe, namespace: __NS__}
-data:
-  probe.py: |
-    import os, time, torch
-    torch.cuda.set_per_process_memory_fraction(1.0)
-    free, total = torch.cuda.mem_get_info()
-    print("start: mem_get_info total %d MiB free %d MiB; share %s" % (total >> 20, free >> 20, os.environ.get("OIF_GPU_MEMORY_FRACTION")), flush=True)
-    want, step, got, xs = int(os.environ["WANT_GIB"]) << 30, 256 << 20, 0, []
-    while got + step <= want:
-        try:
-            xs.append(torch.ones(step // 2, dtype=torch.float16, device="cuda")); torch.cuda.synchronize(); got += step
-        except RuntimeError as e:
-            print("allocation failed after %d MiB: %s" % (got >> 20, str(e).splitlines()[0][:150]), flush=True); break
-    print("allocated %d MiB of %d MiB asked" % (got >> 20, want >> 20), flush=True)
-    print("HOLDING", flush=True); time.sleep(int(os.environ["HOLD"]))
-EOF
 
 say; say "1. control, no plugin: a 0.25 pod asks for 30 GiB"
 pod ctl-a 0.25 30 20; wait_hold ctl-a; show ctl-a
