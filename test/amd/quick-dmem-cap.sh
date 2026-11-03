@@ -16,7 +16,7 @@ REMOTE=/var/tmp/oif-gf
 IMAGE=docker.io/rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0@sha256:099f59a3bee9c436f5cc57db6bc6076fdeda579c57e9e22ae40f856d5905b3e4
 say() { echo "$*" | tee -a "$OUT"; }
 die() { say "FAIL: $*"; exit 1; }
-k() { ssh "$CP" sudo kubectl "$@"; }
+k() { ssh "$CP" sudo kubectl --kubeconfig /etc/kubernetes/admin.conf "$@"; }
 g() { ssh "$NODE" "$@"; }
 
 pod() {   # name fraction want_gib hold_s: a KAI-scheduled pod on the amd pool that allocates want_gib, PyTorch limit lifted
