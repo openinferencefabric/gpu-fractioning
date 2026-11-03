@@ -82,7 +82,7 @@ pod_mem() {   # pod: its GPU memory cap and use, one line (AMD: dmem of the pod 
   local uid; uid=$(k -n "$NS" get pod "$1" -o jsonpath='{.metadata.uid}')
   g "d=\$(find /sys/fs/cgroup/kubepods.slice -maxdepth 2 -type d -name '*pod${uid//-/_}.slice' | head -1)
      [ -n \"\$d\" ] || { echo 'pod cgroup gone'; exit 0; }
-     awk '{print \$2}' \$d/dmem.max | { read m; case \$m in max) echo -n 'cap none'; *) echo -n \"cap \$((m/1048576)) MiB\";; esac; }
+     awk '{print \$2}' \$d/dmem.max | { read m; case \$m in max) echo -n 'cap none';; *) echo -n \"cap \$((m/1048576)) MiB\";; esac; }
      awk '{printf \", in use %d MiB\n\", \$2/1048576}' \$d/dmem.current"
 }
 
