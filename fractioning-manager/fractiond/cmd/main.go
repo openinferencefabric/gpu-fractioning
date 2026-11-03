@@ -16,6 +16,7 @@ import (
 
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/common/configuration"
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/fractiond/internal"
+	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/fractiond/internal/amd"
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/fractiond/internal/audit"
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/fractiond/internal/readiness"
 )
@@ -41,6 +42,17 @@ func main() {
 		logger.Info("retroactive enforcement enabled", "criSocket", flags.criSocket, "stopTimeout", flags.stopTimeout)
 	}
 
+	var amdHost *amd.Host
+	switch flags.gpuVendor {
+	case "nvidia":
+	case "amd":
+		amdHost = &amd.Host{SysRoot: flags.sysRoot, CgroupRoot: flags.cgroupRoot}
+		logger.Info("AMD backend: pod VRAM capped with the dmem cgroup controller", "sysRoot", flags.sysRoot, "cgroupRoot", flags.cgroupRoot)
+	default:
+		logger.Error("unknown GPU vendor", "gpuVendor", flags.gpuVendor)
+		os.Exit(1)
+	}
+
 	plugin, err := internal.NewPlugin(internal.Config{
 		AnnotationPrefix:       flags.annotationPrefix,
 		MPSPipeDirectory:       flags.mpsPipeDir,
@@ -52,6 +64,7 @@ func main() {
 		LogPodEvents:           flags.logPodEvents,
 		Log:                    logger,
 		Readiness:              readyState,
+		AMD:                    amdHost,
 	}, stopper)
 	if err != nil {
 		logger.Error("failed to create plugin", "error", err)

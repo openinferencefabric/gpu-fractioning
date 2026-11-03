@@ -13,6 +13,7 @@ import (
 
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/common/mapping/fsstore"
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/common/mapping/store"
+	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/fractiond/internal/amd"
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/fractiond/internal/annotations"
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/fractiond/internal/audit"
 	"github.com/kai-scheduler/gpu-fractioning/fractioning-manager/fractiond/internal/events"
@@ -75,6 +76,12 @@ type Config struct {
 	// delivered the full container state, so registration succeeded) and back to
 	// not-ready on Shutdown (the runtime is disconnecting).
 	Readiness ReadinessSetter
+
+	// AMD, when non-nil, switches the plugin to AMD GPUs: on CreateContainer it
+	// caps the pod's VRAM with the dmem cgroup controller (package amd) instead
+	// of injecting the NVIDIA env vars and MPS mount. Retroactive enforcement is
+	// NVIDIA-only and must be off.
+	AMD *amd.Host
 }
 
 // Plugin implements the GPU fractioning NRI handler logic. It has two independent
@@ -113,6 +120,8 @@ type Plugin struct {
 
 	// sentinel runs retroactive enforcement on Synchronize; nil when disabled.
 	sentinel *audit.Sentinel
+
+	amd *amd.Host
 }
 
 // NewPlugin creates a Plugin from cfg. Empty mapping defaults are filled in so a
@@ -139,6 +148,10 @@ func NewPlugin(cfg Config, stopper audit.ContainerStopper) (*Plugin, error) {
 		LogEvents: func() bool { return logPodEvents },
 	})
 
+	if cfg.AMD != nil && cfg.RetroactiveEnforcement {
+		return nil, fmt.Errorf("retroactive enforcement is not supported on AMD GPUs")
+	}
+
 	var sentinel *audit.Sentinel
 	if cfg.RetroactiveEnforcement {
 		if stopper == nil {
@@ -162,6 +175,7 @@ func NewPlugin(cfg Config, stopper audit.ContainerStopper) (*Plugin, error) {
 		events:           proc,
 		adapter:          adapter{annotationPrefix: cfg.AnnotationPrefix, log: log},
 		readiness:        cfg.Readiness,
+		amd:              cfg.AMD,
 		sentinel:         sentinel,
 	}, nil
 }
@@ -219,6 +233,9 @@ func (p *Plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, contai
 // container creation is blocked — in which case the mapping is NOT recorded,
 // since the container will not exist.
 func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	if p.amd != nil {
+		return nil, nil, p.capAMD(pod, ctr)
+	}
 	adj, err := p.buildAdjustment(pod, ctr)
 	if err != nil {
 		// Fail-closed: the runtime will refuse to create the container, so do
@@ -346,6 +363,37 @@ func (p *Plugin) buildAdjustment(pod *api.PodSandbox, ctr *api.Container) (*api.
 // containerHasEnv reports whether the container's spec already defines the given
 // environment variable (as "KEY=VALUE" or a bare "KEY"), so the caller can
 // replace it rather than append a duplicate.
+// capAMD sets the kernel VRAM cap for a container that shares an AMD GPU. The
+// devices themselves are given by the AMD device-sharing plugin (oif-amd-share);
+// this only adds the limit. A share that cannot be capped refuses the container
+// unless FailOpen, mirroring the NVIDIA path.
+func (p *Plugin) capAMD(pod *api.PodSandbox, ctr *api.Container) error {
+	req, err := amd.Parse(pod.GetAnnotations(), ctr.GetName())
+	if err == nil && req == nil {
+		return nil
+	}
+	var limit int64
+	if err == nil {
+		limit, err = p.amd.Apply(pod.GetLinux().GetCgroupParent(), req)
+	}
+	if err != nil {
+		p.Log.Warn("failed to cap AMD GPU memory", "container", ctr.GetName(), "pod", pod.GetName(), "error", err)
+		if !p.FailOpen {
+			return fmt.Errorf("container %q in pod %q: %w", ctr.GetName(), pod.GetName(), err)
+		}
+		return nil
+	}
+	p.Log.Info("capped AMD GPU memory",
+		"container", ctr.GetName(),
+		"pod", pod.GetName(),
+		"gpu", req.BDF,
+		"fraction", req.Fraction,
+		"limitMiB", limit>>20,
+		"cgroupParent", pod.GetLinux().GetCgroupParent(),
+	)
+	return nil
+}
+
 func containerHasEnv(ctr *api.Container, key string) bool {
 	prefix := key + "="
 	for _, kv := range ctr.GetEnv() {

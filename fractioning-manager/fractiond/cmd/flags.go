@@ -65,6 +65,11 @@ type cliFlags struct {
 	criSocket string
 	// stopTimeout is the grace period handed to the runtime per container stop.
 	stopTimeout time.Duration
+	// gpuVendor selects the backend: nvidia (env vars, MPS) or amd (dmem cgroup VRAM cap).
+	gpuVendor string
+	// sysRoot and cgroupRoot are the host's /sys and cgroup v2 mount, read and written by the amd backend.
+	sysRoot    string
+	cgroupRoot string
 }
 
 func parseFlags() cliFlags {
@@ -87,6 +92,12 @@ func parseFlags() cliFlags {
 	flag.BoolVar(&f.retroactiveEnforcement, "retroactive-enforcement", env.Bool("RETROACTIVE_ENFORCEMENT", true), "on NRI (re)connect, stop GPU-fractioning containers missing injection so kubelet recreates them correctly")
 	flag.StringVar(&f.criSocket, "cri-socket", env.String("CRI_SOCKET", defaultCRISocketPath), "CRI runtime socket used to stop containers during retroactive enforcement")
 	flag.DurationVar(&f.stopTimeout, "stop-timeout", 30*time.Second, "grace period handed to the runtime for each container stop during enforcement")
+	flag.StringVar(&f.gpuVendor, "gpu-vendor", env.String("GPU_VENDOR", "nvidia"), "GPU backend: nvidia, or amd (caps a pod's VRAM with the dmem cgroup controller; retroactive enforcement off)")
+	flag.StringVar(&f.sysRoot, "sys-root", env.String("SYS_ROOT", "/sys"), "host /sys (amd backend)")
+	flag.StringVar(&f.cgroupRoot, "cgroup-root", env.String("CGROUP_ROOT", "/sys/fs/cgroup"), "host cgroup v2 mount (amd backend)")
 	flag.Parse()
+	if f.gpuVendor == "amd" {
+		f.retroactiveEnforcement = false
+	}
 	return f
 }
